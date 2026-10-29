@@ -473,6 +473,58 @@ async def _file_exists(source: dagger.Directory, name: str) -> bool:
         return False
 
 
+def _parse_build_scalars(text: str) -> dict[str, str]:
+    """Extract scalar config keys from the checks.build block: cache_url,
+    cache_user, cache_secret_uri, cache_push. Same minimal line-based parse
+    as _parse_hooks (module runtime has no pyyaml); values verbatim (outer
+    quotes stripped). This keeps modules self-configuring — the reusable
+    workflow only ever runs `dagger call --mod <module> build --source=.`
+    and passes no per-repo args.
+    """
+    scalars: dict[str, str] = {}
+    keys = {"cache_url", "cache_user", "cache_secret_uri", "cache_push"}
+    top = None
+    seen_checks = False
+    seen_build = False
+    seen_matrix = False
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            top = key0.strip()
+            seen_checks = top == "checks" and not val0.strip()
+            seen_build = top == "build" and not val0.strip()
+            seen_matrix = False
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if seen_build and not seen_matrix and indent > 0:
+            # top-level build: block (same shape as the hooks parser accepts)
+            if key in keys and val:
+                scalars.setdefault(key, _strip_outer_quotes(val))
+            if key == "matrix" and not val:
+                seen_matrix = True
+            continue
+        if not (seen_checks and indent > 0):
+            continue
+        if key == "build" and not val:
+            seen_build = True
+            seen_matrix = False
+            continue
+        if key == "matrix" and not val and seen_build:
+            seen_matrix = True
+            continue
+        if seen_build and not seen_matrix and key in keys and val:
+            scalars.setdefault(key, _strip_outer_quotes(val))
+    return scalars
+
+
 async def _detect_tool(source: dagger.Directory, hooks: dict[str, str]) -> str:
     """Pick "maven" | "gradle" | "gradle-wrapper".
 
@@ -564,8 +616,9 @@ class ChecksJava:
             cfg = await source.file(".github/truenorth.yaml").contents()
             hooks = _parse_hooks(cfg)
             matrix = _parse_matrix(cfg)
+            scalars = _parse_build_scalars(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
-            hooks, matrix = {}, {}
+            hooks, matrix, scalars = {}, {}, {}
         venv: dict[str, str] = {}
         if variant:
             if variant not in matrix:
@@ -580,16 +633,34 @@ class ChecksJava:
         jdk = venv.get("JAVA_VERSION", DEFAULT_JDK)
         gradle_ver = venv.get("GRADLE_VERSION", DEFAULT_GRADLE_VERSION)
 
-        # remote build cache: function args win, runner env is the fallback
+        # remote build cache: function args > truenorth.yaml scalars > env.
+        # The yaml scalars keep the module self-configuring (the reusable
+        # workflow passes no per-repo args); cache_secret_uri resolves
+        # ENGINE-side via the dagger secret provider (env: URIs need the var
+        # in the ENGINE's env — true for in-pod engines, not shared ones).
+        cache_pass_val = ""
+        if cache_pass is not None:
+            cache_pass_val = await cache_pass.plaintext()
+        elif scalars.get("cache_secret_uri"):
+            try:
+                cache_pass_val = await dag.secret(scalars["cache_secret_uri"]).plaintext()
+            except Exception as exc:  # noqa: BLE001 — provider missing -> clear failure
+                raise RuntimeError(
+                    f"cache_secret_uri '{scalars['cache_secret_uri']}' could not be "
+                    f"resolved by the engine secret provider: {exc}") from exc
+        push_val = str(cache_push)
+        if cache_push and scalars.get("cache_push", "").strip().lower() in ("false", "no", "0"):
+            push_val = "false"
         cache_cfg = {
             "TRUENORTH_GRADLE_CACHE_URL": cache_url.strip()
+            or scalars.get("cache_url", "").strip()
             or venv.get("TRUENORTH_GRADLE_CACHE_URL", os.environ.get("TRUENORTH_GRADLE_CACHE_URL", "")),
             "TRUENORTH_GRADLE_CACHE_USER": cache_user.strip()
+            or scalars.get("cache_user", "").strip()
             or venv.get("TRUENORTH_GRADLE_CACHE_USER", os.environ.get("TRUENORTH_GRADLE_CACHE_USER", "")),
-            "TRUENORTH_GRADLE_CACHE_PASS": (await cache_pass.plaintext()) if cache_pass is not None
-            else venv.get("TRUENORTH_GRADLE_CACHE_PASS", os.environ.get("TRUENORTH_GRADLE_CACHE_PASS", "")),
-            "TRUENORTH_GRADLE_CACHE_PUSH": venv.get("TRUENORTH_GRADLE_CACHE_PUSH",
-                                                     str(cache_push)),
+            "TRUENORTH_GRADLE_CACHE_PASS": cache_pass_val
+            or venv.get("TRUENORTH_GRADLE_CACHE_PASS", os.environ.get("TRUENORTH_GRADLE_CACHE_PASS", "")),
+            "TRUENORTH_GRADLE_CACHE_PUSH": venv.get("TRUENORTH_GRADLE_CACHE_PUSH", push_val),
         }
         cache_url = cache_cfg["TRUENORTH_GRADLE_CACHE_URL"].strip()
         cache_on = bool(cache_url)
