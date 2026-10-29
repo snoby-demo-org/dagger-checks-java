@@ -101,8 +101,6 @@ from dagger import dag, function, object_type
 DEFAULT_JDK = "21"
 DEFAULT_GRADLE_VERSION = "9.2.1"
 GRADLE_INIT_PATH = "/tmp/tn-build-cache.init.gradle"
-_CACHE_ENV = ("TRUENORTH_GRADLE_CACHE_URL", "TRUENORTH_GRADLE_CACHE_USER",
-              "TRUENORTH_GRADLE_CACHE_PASS", "TRUENORTH_GRADLE_CACHE_PUSH")
 
 # Auto-generated at run time when TRUENORTH_GRADLE_CACHE_URL is set. An init
 # script applies to any build (groovy or kotlin DSL projects) and injects the
@@ -115,7 +113,8 @@ settingsEvaluated { settings ->
     local { enabled = true }
     remote(HttpBuildCache) {
       url = java.net.URI.create(System.getenv('TRUENORTH_GRADLE_CACHE_URL'))
-      push = Boolean.parseBoolean(System.getenv('TRUENORTH_GRADLE_CACHE_PUSH') ?: 'true')
+      // fail-closed: a missing env var must never default to push
+      push = Boolean.parseBoolean(System.getenv('TRUENORTH_GRADLE_CACHE_PUSH') ?: 'false')
       def u = System.getenv('TRUENORTH_GRADLE_CACHE_USER')
       def p = System.getenv('TRUENORTH_GRADLE_CACHE_PASS')
       if (u != null && !u.isEmpty() && p != null) {
@@ -143,7 +142,7 @@ INIT=/tmp/tn-build-cache.init.gradle
 GFLAGS=""
 if [ -n "${TRUENORTH_GRADLE_CACHE_URL:-}" ] && [ -f "$INIT" ]; then
   GFLAGS="--init-script $INIT --build-cache"
-  log "remote build cache: $TRUENORTH_GRADLE_CACHE_URL (push=${TRUENORTH_GRADLE_CACHE_PUSH:-true})"
+  log "remote build cache: $TRUENORTH_GRADLE_CACHE_URL (push=${TRUENORTH_GRADLE_CACHE_PUSH:-false})"
 else
   log "remote build cache: not configured (local /root/.gradle cache only)"
 fi
@@ -218,7 +217,7 @@ fi
     HITS=$(grep -c 'FROM-CACHE' /tmp/build.log 2>/dev/null); HITS=${HITS%%$'\n'*}; HITS=${HITS:-0}
     UTD=$(grep -c 'UP-TO-DATE' /tmp/build.log 2>/dev/null); UTD=${UTD%%$'\n'*}; UTD=${UTD:-0}
     log "cache evidence: $HITS FROM-CACHE, $UTD UP-TO-DATE"
-    grep -iE 'could not (load|remote)|unable to (load|store)|Caching has been disabled' /tmp/build.log 2>/dev/null | head -5 | while IFS= read -r l; do
+    grep -iE 'remote build cache|caching has been disabled|could not (load|remote)|unable to (load|store)|response code [45][0-9][0-9]' /tmp/build.log 2>/dev/null | head -5 | while IFS= read -r l; do
       log "cache-diag: $l"
     done
   fi
@@ -525,6 +524,34 @@ def _parse_build_scalars(text: str) -> dict[str, str]:
     return scalars
 
 
+def _resolve_cache_push(arg: bool | None, yaml_val: str, venv: dict[str, str]) -> str:
+    """FAIL-CLOSED push resolution (v1.1.2 review fix).
+
+    Precedence: explicit --cache-push arg > pull_request downgrade > yaml
+    cache_push scalar > runner env TRUENORTH_GRADLE_CACHE_PUSH > trusted
+    GHA event auto-detect > false. Repo content (truenorth.yaml / variant
+    env) can never re-enable push on a pull_request build — a PR controls
+    both, and its build logic is untrusted. Unknown context never pushes.
+    """
+    if arg is not None:
+        return str(bool(arg)).lower()
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event == "pull_request":
+        return "false"
+    y = (yaml_val or "").strip().lower()
+    if y in ("true", "yes", "1"):
+        return "true"
+    if y in ("false", "no", "0"):
+        return "false"
+    e = (venv.get("TRUENORTH_GRADLE_CACHE_PUSH")
+         or os.environ.get("TRUENORTH_GRADLE_CACHE_PUSH") or "").strip().lower()
+    if e in ("true", "yes", "1"):
+        return "true"
+    if e in ("false", "no", "0"):
+        return "false"
+    return "true" if event in ("push", "schedule", "workflow_dispatch") else "false"
+
+
 async def _detect_tool(source: dagger.Directory, hooks: dict[str, str]) -> str:
     """Pick "maven" | "gradle" | "gradle-wrapper".
 
@@ -588,7 +615,7 @@ class ChecksJava:
                     cache_url: str = "",
                     cache_user: str = "",
                     cache_pass: dagger.Secret | None = None,
-                    cache_push: bool = True) -> str:
+                    cache_push: bool | None = None) -> str:
         """REAL — the Java/JVM BUILD LEG (not a scan check): resolve -> build (FR-73).
 
         Maven and Gradle are both first-class: the toolchain image is chosen
@@ -610,7 +637,13 @@ class ChecksJava:
         Remote build cache: pass --cache-url on the dagger call (or set
         TRUENORTH_GRADLE_CACHE_URL in the runner env / a variant's env
         block) and the module injects an init script wiring HttpBuildCache
-        with push=true into every gradle invocation.
+        into every gradle invocation. Push is FAIL-CLOSED (v1.1.2): it is
+        off unless --cache-push=true, a cache_push: true yaml scalar,
+        TRUENORTH_GRADLE_CACHE_PUSH=true, or a trusted GHA event
+        (push/schedule/workflow_dispatch) enables it — never on
+        pull_request, where repo content cannot re-enable it. The cache
+        password travels as a dagger Secret (with_secret_variable), never
+        as a plaintext env variable.
         """
         try:
             cfg = await source.file(".github/truenorth.yaml").contents()
@@ -638,19 +671,19 @@ class ChecksJava:
         # workflow passes no per-repo args); cache_secret_uri resolves
         # ENGINE-side via the dagger secret provider (env: URIs need the var
         # in the ENGINE's env — true for in-pod engines, not shared ones).
-        cache_pass_val = ""
-        if cache_pass is not None:
-            cache_pass_val = await cache_pass.plaintext()
-        elif scalars.get("cache_secret_uri"):
+        cache_secret: dagger.Secret | None = cache_pass
+        if cache_secret is None and scalars.get("cache_secret_uri"):
             try:
-                cache_pass_val = await dag.secret(scalars["cache_secret_uri"]).plaintext()
+                # .id() forces resolution now so a bad URI fails with a
+                # clear message instead of deep inside the exec tree.
+                await dag.secret(scalars["cache_secret_uri"]).id()
+                cache_secret = dag.secret(scalars["cache_secret_uri"])
             except Exception as exc:  # noqa: BLE001 — provider missing -> clear failure
                 raise RuntimeError(
                     f"cache_secret_uri '{scalars['cache_secret_uri']}' could not be "
                     f"resolved by the engine secret provider: {exc}") from exc
-        push_val = str(cache_push)
-        if cache_push and scalars.get("cache_push", "").strip().lower() in ("false", "no", "0"):
-            push_val = "false"
+        push_val = _resolve_cache_push(
+            cache_push, scalars.get("cache_push", ""), venv)
         cache_cfg = {
             "TRUENORTH_GRADLE_CACHE_URL": cache_url.strip()
             or scalars.get("cache_url", "").strip()
@@ -658,9 +691,9 @@ class ChecksJava:
             "TRUENORTH_GRADLE_CACHE_USER": cache_user.strip()
             or scalars.get("cache_user", "").strip()
             or venv.get("TRUENORTH_GRADLE_CACHE_USER", os.environ.get("TRUENORTH_GRADLE_CACHE_USER", "")),
-            "TRUENORTH_GRADLE_CACHE_PASS": cache_pass_val
-            or venv.get("TRUENORTH_GRADLE_CACHE_PASS", os.environ.get("TRUENORTH_GRADLE_CACHE_PASS", "")),
-            "TRUENORTH_GRADLE_CACHE_PUSH": venv.get("TRUENORTH_GRADLE_CACHE_PUSH", push_val),
+            # PASS is deliberately absent: it travels as a dagger Secret
+            # (with_secret_variable), never as a plaintext env variable.
+            "TRUENORTH_GRADLE_CACHE_PUSH": push_val,
         }
         cache_url = cache_cfg["TRUENORTH_GRADLE_CACHE_URL"].strip()
         cache_on = bool(cache_url)
@@ -690,9 +723,20 @@ class ChecksJava:
         for k in sorted(venv):
             ctr = ctr.with_env_variable(k, venv[k])
         if cache_on:
-            for k in _CACHE_ENV:
+            for k in sorted(cache_cfg):
                 if cache_cfg[k]:
                     ctr = ctr.with_env_variable(k, cache_cfg[k])
+            legacy_pass = (venv.get("TRUENORTH_GRADLE_CACHE_PASS")
+                           or os.environ.get("TRUENORTH_GRADLE_CACHE_PASS") or "")
+            if cache_secret is not None:
+                ctr = ctr.with_secret_variable(
+                    "TRUENORTH_GRADLE_CACHE_PASS", cache_secret)
+            elif legacy_pass:
+                # legacy channel (variant env / module env); wrapped as a
+                # Secret so it still never lands in plain container env.
+                ctr = ctr.with_secret_variable(
+                    "TRUENORTH_GRADLE_CACHE_PASS",
+                    dag.set_secret("tn-cache-pass", legacy_pass))
             ctr = ctr.with_new_file(GRADLE_INIT_PATH, GRADLE_INIT_SCRIPT)
         ctr = (
             ctr
